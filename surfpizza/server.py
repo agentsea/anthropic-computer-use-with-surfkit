@@ -9,7 +9,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from surfkit.server.routes import task_router
 
-from .agent import Agent, router
+from .agent import Agent
+from .tool import router
 
 # Configure logging
 logger: Final = logging.getLogger("surfpizza")

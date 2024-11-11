@@ -1,23 +1,32 @@
+import base64
 import logging
 import os
 import time
 import traceback
-from typing import Final, List, Optional, Tuple, Type
+from datetime import datetime
+from io import BytesIO
+from typing import Any, cast, Final, List, Optional, Tuple, Type
 
 from agentdesk.device_v1 import Desktop
 from devicebay import Device
 from pydantic import BaseModel
 from rich.console import Console
 from rich.json import JSON
-from skillpacks import EnvState
-from skillpacks.server.models import V1ActionSelection
 from surfkit.agent import TaskAgent
 from taskara import Task, TaskStatus
 from tenacity import before_sleep_log, retry, stop_after_attempt
-from threadmem import RoleMessage, RoleThread
+from threadmem import RoleThread
 from toolfuse.util import AgentUtils
 
-from .tool import SemanticDesktop, router
+from anthropic import Anthropic
+from anthropic.types.beta import (
+    BetaMessageParam,
+    BetaTextBlockParam,
+    BetaToolResultBlockParam,
+)
+
+from .tool import SemanticDesktop
+from .anthropic import ToolResult, response_to_params, make_api_tool_result
 
 logging.basicConfig(level=logging.INFO)
 logger: Final = logging.getLogger(__name__)
@@ -25,6 +34,9 @@ logger.setLevel(int(os.getenv("LOG_LEVEL", str(logging.DEBUG))))
 
 console = Console(force_terminal=True)
 
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    raise ValueError ("Please set the ANTHROPIC_API_KEY in your environment.")
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 class SurfPizzaConfig(BaseModel):
     pass
@@ -68,57 +80,73 @@ class SurfPizza(TaskAgent):
         # Add standard agent utils to the device
         semdesk.merge(AgentUtils())
 
-        # Open a site if present in the parameters
-        site = task._parameters.get("site") if task._parameters else None
-        if site:
-            console.print(f"▶️ opening site url: {site}", style="blue")
-            task.post_message("assistant", f"opening site url {site}...")
-            semdesk.desktop.open_url(site)
-            console.print("waiting for browser to open...", style="blue")
-            time.sleep(5)
-
         # Get info about the desktop
         info = semdesk.desktop.info()
         screen_size = info["screen_size"]
         console.print(f"Desktop info: {screen_size}")
 
-        # Get the json schema for the tools, excluding actions that aren't useful
-        tools = semdesk.json_schema(
-            exclude_names=[
-                "move_mouse",
-                "click",
-                "drag_mouse",
-                "mouse_coordinates",
-                "take_screenshot",
-                "open_url",
-                "double_click",
-            ]
-        )
+        # Define Anthropic Computer Use tool. Refer to the docs at https://docs.anthropic.com/en/docs/build-with-claude/computer-use#computer-tool
+        self.tools = [
+            {
+                "type": "computer_20241022",
+                "name": "computer",
+                "display_width_px": 1024,
+                "display_height_px": 768,
+                "display_number": 1,
+            },
+        ]
+
         console.print("tools: ", style="purple")
-        console.print(JSON.from_data(tools))
+        console.print(JSON.from_data(self.tools))
 
-        # Create our thread and start with a system prompt
-        thread = RoleThread()
-        thread.post(
-            role="user",
-            msg=(
-                "You are an AI assistant which uses a devices to accomplish tasks. "
-                f"Your current task is {task.description}, and your available tools are {tools} "
-                "For each screenshot I will send you please return the result chosen action as  "
-                f"raw JSON adhearing to the schema {V1ActionSelection.model_json_schema()} "
-                "Let me know when you are ready and I'll send you the first screenshot"
-            ),
+        # Create our thread and start with the task description and system prompt
+        messages = []
+        messages.append(
+            {
+                "role": "user",
+                "content": [BetaTextBlockParam(type="text", text=task.description)],
+            })
+
+        # The following prompt is a modified copy of the prompt from Anthropic's Computer Use Demo project
+        # Some other code lines in this file are also copied from Anthropic's Computer Use Demo project
+        # Original file: https://github.com/anthropics/anthropic-quickstarts/tree/main/computer-use-demo/computer_use_demo/tools
+
+        SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
+        * You are utilising an Linux virtual machine of screen size {screen_size} with internet access.
+        * To open firefox, please just click on the web browser icon.  Note, firefox-esr is what is installed on your system.
+        * When viewing a page it can be helpful to zoom out so that you can see everything on the page.  Either that, or make sure you scroll down to see everything before deciding something isn't available.
+        * When using your computer function calls, they take a while to run and send back to you.
+        * The current date is {datetime.today().strftime('%A, %B %-d, %Y')}.
+        </SYSTEM_CAPABILITY>
+
+        <IMPORTANT>
+        * When using Firefox, if a startup wizard appears, IGNORE IT.  Do not even click "skip this step".  Instead, click on the address bar where it says "Search or enter address", and enter the appropriate search term or URL there.
+        * If the item you are looking at is a pdf, if after taking a single screenshot of the pdf it seems that you want to read the entire document instead of trying to continue to read the pdf from your screenshots + navigation, determine the URL, use curl to download the pdf, install and use pdftotext to convert it to a text file, and then read that text file directly with your StrReplaceEditTool.
+        </IMPORTANT>"""
+
+        self.system = BetaTextBlockParam(
+            type="text",
+            text=f"{SYSTEM_PROMPT}",
         )
-        response = router.chat(thread, namespace="system")
-        console.print(f"system prompt response: {response}", style="blue")
-        thread.add_msg(response.msg)
 
-        # Loop to run actions
+        self.action_mapping = {
+            "key": "hot_key",
+            "type": "type_text",
+            "mouse_move": "move_mouse",
+            "left_click": "click",
+            "left_click_drag": "drag_mouse",
+            "right_click": "N/A",
+            "middle_click": "N/A",
+            "double_click": "double_click",
+            "screenshot": "take_screenshots",
+            "cursor_position": "mouse_coordinates",
+        }
+
         for i in range(max_steps):
             console.print(f"-------step {i + 1}", style="green")
 
             try:
-                thread, done = self.take_action(semdesk, task, thread)
+                messages, done = self.take_action(semdesk, task, messages)
             except Exception as e:
                 console.print(f"Error: {e}", style="red")
                 task.status = TaskStatus.FAILED
@@ -148,14 +176,14 @@ class SurfPizza(TaskAgent):
         self,
         semdesk: SemanticDesktop,
         task: Task,
-        thread: RoleThread,
+        messages: list[BetaMessageParam],
     ) -> Tuple[RoleThread, bool]:
         """Take an action
 
         Args:
             desktop (SemanticDesktop): Desktop to use
             task (str): Task to accomplish
-            thread (RoleThread): Role thread for the task
+            messages: Messages (LLM exchange thread) for the task
 
         Returns:
             bool: Whether the task is complete
@@ -173,118 +201,130 @@ class SurfPizza(TaskAgent):
                 if task.status == TaskStatus.CANCELING:
                     task.status = TaskStatus.CANCELED
                     task.save()
-                return thread, True
+                return messages, True
 
             console.print("taking action...", style="white")
 
-            # Create a copy of the thread, and remove old images
-            _thread = thread.copy()
-            _thread.remove_images()
-
-            # Take a screenshot of the desktop and post a message with it
-            screenshot_img = semdesk.desktop.take_screenshots()[0]
-            console.print(f"screenshot img type: {type(screenshot_img)}")
-            task.post_message(
-                "assistant",
-                "current image",
-                images=[screenshot_img],
-                thread="debug",
+            raw_response = client.beta.messages.with_raw_response.create(
+                max_tokens=4096,
+                messages=messages,
+                model="claude-3-5-sonnet-20241022",
+                system=[self.system],
+                tools=self.tools,
+                betas=["computer-use-2024-10-22"],
             )
-
-            # Get the current mouse coordinates
-            x, y = semdesk.desktop.mouse_coordinates()
-            console.print(f"mouse coordinates: ({x}, {y})", style="white")
-
-            # Craft the message asking the MLLM for an action
-            msg = RoleMessage(
-                role="user",
-                text=(
-                    "Here is a screenshot of the current desktop, please select an action from the provided schema."
-                    "Please return just the raw JSON"
-                ),
-                images=[screenshot_img],
-            )
-            _thread.add_msg(msg)
-
-            # Make the action selection
-            response = router.chat(
-                _thread,
-                namespace="action",
-                expect=V1ActionSelection,
-                agent_id=self.name(),
-            )
-            task.add_prompt(response.prompt)
 
             try:
-                # Post to the user letting them know what the modle selected
-                selection = response.parsed
-                if not selection:
-                    raise ValueError("No action selection parsed")
+                response = raw_response.parse()
+                response_params = response_to_params(response)
 
-                task.post_message("assistant", f"👁️ {selection.observation}")
-                task.post_message("assistant", f"💡 {selection.reason}")
-                console.print("action selection: ", style="white")
-                console.print(JSON.from_data(selection.model_dump()))
-
-                task.post_message(
-                    "assistant",
-                    f"▶️ Taking action '{selection.action.name}' with parameters: {selection.action.parameters}",
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": response_params,
+                    }
                 )
 
             except Exception as e:
                 console.print(f"Response failed to parse: {e}", style="red")
                 raise
 
-            # The agent will return 'result' if it believes it's finished
-            if selection.action.name == "result":
+            # The agent will return 'end_turn' if it believes it's finished
+            if response.stop_reason == "end_turn":
                 console.print("final result: ", style="green")
-                console.print(JSON.from_data(selection.action.parameters))
+                console.print(JSON.from_data(response_params[0]))
                 task.post_message(
                     "assistant",
-                    f"✅ I think the task is done, please review the result: {selection.action.parameters['value']}",
+                    f"✅ I think the task is done, please review the result: {response_params[0]['text']}",
                 )
                 task.status = TaskStatus.FINISHED
                 task.save()
-                return _thread, True
+                return messages, True
 
-            # Find the selected action in the tool
-            action = semdesk.find_action(selection.action.name)
-            console.print(f"found action: {action}", style="blue")
-            if not action:
-                console.print(f"action returned not found: {selection.action.name}")
-                raise SystemError("action not found")
+            tool_result_content: list[BetaToolResultBlockParam] = []
 
-            # Take the selected action
-            try:
-                action_response = semdesk.use(action, **selection.action.parameters)
-            except Exception as e:
-                raise ValueError(f"Trouble using action: {e}")
+            for content_block in response_params:
+                if content_block["type"] == "text":
+                    task.post_message("assistant", f"👁️ {content_block.get('text')}")
+                elif content_block["type"] == "tool_use":
+                    input_args = cast(dict[str, Any], content_block["input"])
+                    action_name = self.action_mapping[input_args["action"]]
+                    console.print(f"found action: {action_name}", style="blue")
+                    
+                    task.post_message(
+                        "assistant",
+                        f"▶️ Taking action '{action_name}' with parameters: {input_args}",
+                    )
 
-            console.print(f"action output: {action_response}", style="blue")
-            if action_response:
-                task.post_message(
-                    "assistant", f"👁️ Result from taking action: {action_response}"
-                )
+                    action_params = input_args.copy()
+                    del action_params["action"]
 
-            # Record the action for feedback and tuning
-            task.record_action(
-                state=EnvState(images=[screenshot_img]),
-                prompt=response.prompt,
-                action=selection.action,
-                tool=semdesk.ref(),
-                result=action_response,
-                agent_id=self.name(),
-                model=response.model,
-            )
+                    # Find the selected action in the tool
+                    action = semdesk.find_action(action_name)
+                    console.print(f"found action: {action}", style="blue")
+                    if not action:
+                        console.print(f"action returned not found: {action_name}")
+                        raise SystemError("action not found")
 
-            _thread.add_msg(response.msg)
-            return _thread, False
+                    # Take the selected action
+                    try:
+                        if action_name != "take_screenshots": # Do not execute if the action is screenshot, coz we take the screenshot later anyway
+                            action_params = self._get_mapped_action_params(action_name, action_params)
+                            action_response = semdesk.use(action, **action_params)
+
+                            console.print(f"action output: {action_response}", style="blue")
+
+                            if action_response:
+                                task.post_message(
+                                    "assistant", f"👁️ Result from taking action: {action_response}"
+                                )
+                    except Exception as e:
+                        raise ValueError(f"Trouble using action: {e}")
+
+                    # Take the screenshot after executing the action, or if the action itself is screenshot
+                    screenshot_img = semdesk.desktop.take_screenshots()[-1]
+                    console.print(f"screenshot img type: {type(screenshot_img)}")
+
+                    buffer = BytesIO()
+                    screenshot_img.save(buffer, format='PNG')
+                    base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+                    result = ToolResult(output=None, error=None, base64_image=base64_image)
+
+                    task.post_message(
+                        "assistant",
+                        "current image",
+                        # images=result.base64_image,
+                        thread="debug",
+                    )
+
+                    tool_result_content.append(
+                        make_api_tool_result(result, content_block["id"])
+                    )
+            
+            if not tool_result_content:
+                return messages, True
+
+            messages.append({"content": tool_result_content, "role": "user"})
+
+            return messages, False
 
         except Exception as e:
             console.print("Exception taking action: ", e)
             traceback.print_exc()
             task.post_message("assistant", f"⚠️ Error taking action: {e} -- retrying...")
             raise e
+
+    def _get_mapped_action_params(self, action_name, action_params) -> ToolResult:
+        if action_name != "screenshot":
+            if action_name in ["move_mouse", "drag_mouse"] and "coordinate" in action_params:
+                action_params["x"] = action_params["coordinate"][0]
+                action_params["y"] = action_params["coordinate"][1]
+                del action_params["coordinate"]
+            if action_name == "hot_key" and "text" in action_params:
+                action_params["keys"] = [action_params["text"]]
+                del action_params["text"]
+            return action_params
 
     @classmethod
     def supported_devices(cls) -> List[Type[Device]]:
