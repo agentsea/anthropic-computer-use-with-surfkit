@@ -9,6 +9,7 @@ from typing import Any, cast, Final, List, Optional, Tuple, Type
 
 from agentdesk.device_v1 import Desktop
 from devicebay import Device
+from mllm import Router
 from pydantic import BaseModel
 from rich.console import Console
 from rich.json import JSON
@@ -25,7 +26,6 @@ from anthropic.types.beta import (
     BetaToolResultBlockParam,
 )
 
-from .tool import SemanticDesktop
 from .anthropic import ToolResult, response_to_params, make_api_tool_result
 
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +37,8 @@ console = Console(force_terminal=True)
 if not os.environ.get("ANTHROPIC_API_KEY"):
     raise ValueError ("Please set the ANTHROPIC_API_KEY in your environment.")
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+router = Router.from_env()
 
 class SurfPizzaConfig(BaseModel):
     pass
@@ -74,14 +76,11 @@ class SurfPizza(TaskAgent):
         if not isinstance(device, Desktop):
             raise ValueError("Only desktop devices supported")
 
-        # Wrap the standard desktop in our special tool
-        semdesk = SemanticDesktop(task=task, desktop=device)
-
         # Add standard agent utils to the device
-        semdesk.merge(AgentUtils())
+        device.merge(AgentUtils())
 
         # Get info about the desktop
-        info = semdesk.desktop.info()
+        info = device.info()
         screen_size = info["screen_size"]
         console.print(f"Desktop info: {screen_size}")
 
@@ -113,7 +112,7 @@ class SurfPizza(TaskAgent):
 
         SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
         * You are utilising an Linux virtual machine of screen size {screen_size} with internet access.
-        * To open firefox, please just click on the web browser icon.  Note, firefox-esr is what is installed on your system.
+        * To open firefox, please just click on the web browser (globe) icon.
         * When viewing a page it can be helpful to zoom out so that you can see everything on the page.  Either that, or make sure you scroll down to see everything before deciding something isn't available.
         * When using your computer function calls, they take a while to run and send back to you.
         * The current date is {datetime.today().strftime('%A, %B %-d, %Y')}.
@@ -146,7 +145,7 @@ class SurfPizza(TaskAgent):
             console.print(f"-------step {i + 1}", style="green")
 
             try:
-                messages, done = self.take_action(semdesk, task, messages)
+                messages, done = self.take_action(device, task, messages)
             except Exception as e:
                 console.print(f"Error: {e}", style="red")
                 task.status = TaskStatus.FAILED
@@ -174,14 +173,14 @@ class SurfPizza(TaskAgent):
     )
     def take_action(
         self,
-        semdesk: SemanticDesktop,
+        device: Desktop,
         task: Task,
         messages: list[BetaMessageParam],
     ) -> Tuple[RoleThread, bool]:
         """Take an action
 
         Args:
-            desktop (SemanticDesktop): Desktop to use
+            device (Desktop): Desktop to use
             task (str): Task to accomplish
             messages: Messages (LLM exchange thread) for the task
 
@@ -260,7 +259,7 @@ class SurfPizza(TaskAgent):
                     del action_params["action"]
 
                     # Find the selected action in the tool
-                    action = semdesk.find_action(action_name)
+                    action = device.find_action(action_name)
                     console.print(f"found action: {action}", style="blue")
                     if not action:
                         console.print(f"action returned not found: {action_name}")
@@ -270,7 +269,7 @@ class SurfPizza(TaskAgent):
                     try:
                         if action_name != "take_screenshots": # Do not execute if the action is screenshot, coz we take the screenshot later anyway
                             action_params = self._get_mapped_action_params(action_name, action_params)
-                            action_response = semdesk.use(action, **action_params)
+                            action_response = device.use(action, **action_params)
 
                             console.print(f"action output: {action_response}", style="blue")
 
@@ -282,7 +281,7 @@ class SurfPizza(TaskAgent):
                         raise ValueError(f"Trouble using action: {e}")
 
                     # Take the screenshot after executing the action, or if the action itself is screenshot
-                    screenshot_img = semdesk.desktop.take_screenshots()[-1]
+                    screenshot_img = device.take_screenshots()[-1]
                     console.print(f"screenshot img type: {type(screenshot_img)}")
 
                     buffer = BytesIO()
