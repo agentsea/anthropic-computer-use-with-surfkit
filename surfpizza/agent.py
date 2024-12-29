@@ -9,7 +9,6 @@ from typing import Any, cast, Final, List, Optional, Tuple, Type
 
 from agentdesk.device_v1 import Desktop
 from devicebay import Device
-from mllm import Router
 from pydantic import BaseModel
 from rich.console import Console
 from rich.json import JSON
@@ -37,8 +36,6 @@ console = Console(force_terminal=True)
 if not os.environ.get("ANTHROPIC_API_KEY"):
     raise ValueError ("Please set the ANTHROPIC_API_KEY in your environment.")
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
-router = Router.from_env()
 
 class SurfPizzaConfig(BaseModel):
     pass
